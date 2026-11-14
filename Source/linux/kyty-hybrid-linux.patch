@@ -55,7 +55,7 @@ index 13dabc7b..d8f77ca0 100644
  #include <atomic>
  #include <chrono>
 diff --git a/src/graphics/host_gpu/renderer/dlss.cpp b/src/graphics/host_gpu/renderer/dlss.cpp
-index d43372e6..e9d90706 100644
+index d43372e6..5eddde69 100644
 --- a/src/graphics/host_gpu/renderer/dlss.cpp
 +++ b/src/graphics/host_gpu/renderer/dlss.cpp
 @@ -1,15 +1,18 @@
@@ -663,7 +663,7 @@ index d43372e6..e9d90706 100644
  	const auto result =
  	    NGX_VULKAN_EVALUATE_DLSS_EXT(static_cast<VkCommandBuffer>(cmd), s.feature, s.params, &eval);
  	buffer.ForgetBoundState();
-@@ -622,4 +703,162 @@ bool RenderExecutor::TryDlssUpscale(CommandBuffer& buffer, PreparedBindings& pix
+@@ -622,4 +703,217 @@ bool RenderExecutor::TryDlssUpscale(CommandBuffer& buffer, PreparedBindings& pix
  #endif
  }
  
@@ -676,10 +676,60 @@ index d43372e6..e9d90706 100644
 +#endif
 +}
 +
-+bool GenerateFrame(RenderContext& context, CommandBuffer& buffer, VulkanImage& input,
-+                   VkImageView input_view, VulkanImage& output, VkImageView output_view, bool hdr) {
++uint32_t NativeFramesToGenerate() {
 +#if KYTY_NGX && !defined(_WIN32)
-+	if (!NativeFrameGenerationRequested()) return false;
++    if (!NativeFrameGenerationRequested()) return 0;
++    auto& s = NativeFg();
++    if (!s.capability_checked && Get().params) {
++        unsigned maximum = 1;
++        NVSDK_NGX_Parameter_GetUI(Get().params, NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, &maximum);
++        s.max_frames = std::clamp(maximum, 1u, 3u);
++        s.capability_checked = true;
++        std::printf("DLSS-G native: runtime supports up to %ux\n", s.max_frames + 1);
++    }
++    const auto setting = [](const char* name, int fallback, int low, int high) {
++        const char* value = std::getenv(name);
++        return value ? std::clamp(std::atoi(value), low, high) : fallback;
++    };
++    const auto maximum = std::min(s.max_frames, unsigned(setting("ASTROHYBRID_DLSSG_MAX_FRAMES", 3, 1, 3)));
++    const auto target = setting("ASTROHYBRID_DLSSG_TARGET", 0, 0, 400);
++    if (target == 0) {
++        s.generated_frames = std::min(s.max_frames, unsigned(setting("ASTROHYBRID_DLSSG_FRAMES", 1, 1, 3)));
++    } else {
++        const auto now = std::chrono::steady_clock::now();
++        if (s.window_start.time_since_epoch().count() == 0) s.window_start = now;
++        else ++s.window_frames;
++        const double elapsed = std::chrono::duration<double>(now - s.window_start).count();
++        if (elapsed >= 0.5) {
++            const double fps = s.window_frames / elapsed;
++            const auto wanted = unsigned(std::clamp(std::ceil(target / std::max(fps, 1.0) - 0.02) - 1.0,
++                                                    1.0, double(maximum)));
++            if (wanted > s.generated_frames || (wanted < s.generated_frames && ++s.lower_windows >= 4)) {
++                s.generated_frames = wanted;
++                s.lower_windows = 0;
++            } else if (wanted == s.generated_frames) {
++                s.lower_windows = 0;
++            }
++            s.window_frames = 0;
++            s.window_start = now;
++        }
++        s.generated_frames = std::clamp(s.generated_frames, 1u, maximum);
++    }
++    static uint32_t reported = 0;
++    if (reported != s.generated_frames) {
++        reported = s.generated_frames;
++        std::printf("DLSS-G native: selected %ux (%u generated frames)\n", reported + 1, reported);
++    }
++    return s.generated_frames;
++#else
++    return 0;
++#endif
++}
++
++uint32_t GenerateFrames(RenderContext& context, CommandBuffer& buffer, VulkanImage& input,
++                        VkImageView input_view, std::span<const GeneratedFrameTarget> outputs, bool hdr) {
++#if KYTY_NGX && !defined(_WIN32)
++	if (!NativeFrameGenerationRequested() || outputs.empty() || outputs.size() > 3) return 0;
 +	auto&           s        = NativeFg();
 +	const bool      usable   = s.inputs && s.camera && !s.failed;
 +	static unsigned attempts = 0;
@@ -689,7 +739,7 @@ index d43372e6..e9d90706 100644
 +		std::fflush(stdout);
 +	}
 +	s.inputs = s.camera = false;
-+	if (!usable) return false;
++	if (!usable) return 0;
 +	buffer.EndRendering();
 +	if (!s.feature || s.width != input.extent.width || s.height != input.extent.height ||
 +	    s.format != input.format) {
@@ -697,7 +747,7 @@ index d43372e6..e9d90706 100644
 +		if (s.feature) NVSDK_NGX_VULKAN_ReleaseFeature(s.feature);
 +		s.feature = nullptr;
 +		if (!s.params && NVSDK_NGX_FAILED(NVSDK_NGX_VULKAN_AllocateParameters(&s.params)))
-+			return false;
++			return 0;
 +		NVSDK_NGX_DLSSG_Create_Params create {};
 +		create.Width                  = input.extent.width;
 +		create.Height                 = input.extent.height;
@@ -710,7 +760,7 @@ index d43372e6..e9d90706 100644
 +		std::fflush(stdout);
 +		if (NVSDK_NGX_FAILED(result) || !s.feature) {
 +			s.failed = true;
-+			return false;
++			return 0;
 +		}
 +		s.width          = create.Width;
 +		s.height         = create.Height;
@@ -720,9 +770,6 @@ index d43372e6..e9d90706 100644
 +	const auto cmd = buffer.Handle();
 +	NativeTransit(input, cmd, vk::ImageAspectFlagBits::eColor,
 +	              vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderSampledRead);
-+	NativeTransit(output, cmd, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
-+	              vk::AccessFlagBits2::eShaderStorageRead |
-+	                  vk::AccessFlagBits2::eShaderStorageWrite);
 +	const auto resource = [](const VulkanImage& image, VkImageView view, VkImageAspectFlags aspect,
 +	                         bool write) {
 +		return NVSDK_NGX_Create_ImageView_Resource_VK(
@@ -730,7 +777,6 @@ index d43372e6..e9d90706 100644
 +		    static_cast<VkFormat>(image.format), image.extent.width, image.extent.height, write);
 +	};
 +	auto backbuffer = resource(input, input_view, VK_IMAGE_ASPECT_COLOR_BIT, false);
-+	auto generated  = resource(output, output_view, VK_IMAGE_ASPECT_COLOR_BIT, true);
 +	auto depth =
 +	    resource(s.depth, static_cast<VkImageView>(s.depth_view), VK_IMAGE_ASPECT_DEPTH_BIT, false);
 +	auto         motion = resource(s.motion, static_cast<VkImageView>(s.motion_view),
@@ -741,10 +787,10 @@ index d43372e6..e9d90706 100644
 +	const auto vp = NativeMultiply(s.view, s.projection);
 +	if (!NativeInverse(s.projection, inverse_projection) || !NativeInverse(s.view, inverse_view) ||
 +	    !NativeInverse(vp, inverse_vp))
-+		return false;
++		return 0;
 +	const auto   to_previous = s.previous_valid ? NativeMultiply(inverse_vp, s.previous) : identity;
 +	NativeMatrix to_current {};
-+	if (!NativeInverse(to_previous, to_current)) return false;
++	if (!NativeInverse(to_previous, to_current)) return 0;
 +	NVSDK_NGX_DLSSG_Opt_Eval_Params options {};
 +	std::memcpy(options.cameraViewToClip, s.projection.data(), 64);
 +	std::memcpy(options.clipToCameraView, inverse_projection.data(), 64);
@@ -777,15 +823,24 @@ index d43372e6..e9d90706 100644
 +	eval.pBackbuffer        = &backbuffer;
 +	eval.pDepth             = &depth;
 +	eval.pMVecs             = &motion;
-+	eval.pOutputInterpFrame = &generated;
-+	const auto result       = NGX_VK_EVALUATE_DLSSG(static_cast<VkCommandBuffer>(cmd), s.feature,
-+	                                                s.params, &eval, &options);
-+	buffer.ForgetBoundState();
-+	if (NVSDK_NGX_FAILED(result)) {
-+		std::printf("DLSS-G native: evaluation failed 0x%08x\n", unsigned(result));
-+		s.failed = true;
-+		return false;
-+	}
++    options.multiFrameCount = static_cast<uint32_t>(outputs.size());
++    for (uint32_t i = 0; i < outputs.size(); ++i) {
++        auto& output = *outputs[i].image;
++        NativeTransit(output, cmd, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
++                      vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite);
++        auto generated = resource(output, outputs[i].view, VK_IMAGE_ASPECT_COLOR_BIT, true);
++        eval.pOutputInterpFrame = &generated;
++        options.multiFrameIndex = i + 1;
++        const auto result = NGX_VK_EVALUATE_DLSSG(static_cast<VkCommandBuffer>(cmd), s.feature,
++                                                s.params, &eval, &options);
++        buffer.ForgetBoundState();
++        if (NVSDK_NGX_FAILED(result)) {
++            std::printf("DLSS-G native: evaluation %u/%u failed 0x%08x\n",
++                        i + 1, options.multiFrameCount, unsigned(result));
++            s.failed = true;
++            return 0;
++        }
++    }
 +	s.previous       = vp;
 +	s.previous_frame = s.frame;
 +	s.previous_valid = true;
@@ -794,9 +849,9 @@ index d43372e6..e9d90706 100644
 +		            static_cast<unsigned long long>(s.evaluations));
 +		std::fflush(stdout);
 +	}
-+	return !options.reset;
++	return options.reset ? 0 : static_cast<uint32_t>(outputs.size());
 +#else
-+	return false;
++	return 0;
 +#endif
 +}
 +void Shutdown(RenderContext& context) {
@@ -827,12 +882,14 @@ index d43372e6..e9d90706 100644
 +
  } // namespace Libs::Graphics
 diff --git a/src/graphics/host_gpu/renderer/dlss.h b/src/graphics/host_gpu/renderer/dlss.h
-index ae1728a9..ba521755 100644
+index ae1728a9..3285087a 100644
 --- a/src/graphics/host_gpu/renderer/dlss.h
 +++ b/src/graphics/host_gpu/renderer/dlss.h
-@@ -3,6 +3,13 @@
+@@ -2,7 +2,15 @@
+ #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DLSS_H_
  
  #include <cstdint>
++#include <span>
  #include <vector>
 +#include <vulkan/vulkan_core.h>
 +
@@ -844,7 +901,7 @@ index ae1728a9..ba521755 100644
  
  // ASTROHYBRID_DLSS=1 (default 0; needs a build with KYTY_NGX_SDK_DIR): NVIDIA DLSS Super Resolution
  // in place of Astro Bot's own temporal upscale pass (RenderExecutor::TryDlssUpscale, dlss.cpp).
-@@ -28,12 +35,17 @@
+@@ -28,12 +36,22 @@
  // it free: run with ASTROHYBRID_CUDA_HOLE=1 (AnyPS5 libc, 0xDC00000000-0xEC00000000), otherwise
  // device creation fails with the extension (ASTROHYBRID_DLSS_PROBE=1 reports it).
  // Options: ASTROHYBRID_DLSS_QUALITY=quality|balanced|performance|dlaa (the DLSS preset family;
@@ -860,8 +917,13 @@ index ae1728a9..ba521755 100644
  [[nodiscard]] bool Requested();
 +[[nodiscard]] bool NativeFrameGenerationRequested();
 +void               Shutdown(RenderContext&);
-+bool GenerateFrame(RenderContext&, CommandBuffer&, VulkanImage&, VkImageView, VulkanImage&,
-+                   VkImageView, bool);
++struct GeneratedFrameTarget {
++    VulkanImage* image;
++    VkImageView view;
++};
++uint32_t NativeFramesToGenerate();
++uint32_t GenerateFrames(RenderContext&, CommandBuffer&, VulkanImage&, VkImageView,
++                        std::span<const GeneratedFrameTarget>, bool);
  // Device creation: the extensions NGX needs (empty when not requested or not built in).
  void RequiredExtensions(std::vector<const char*>& instance, std::vector<const char*>& device);
  // ASTROHYBRID_DLSS_PROBE=1: whether a device with VK_NVX_binary_import can be created now.
@@ -899,10 +961,10 @@ index 80f8eab1..65652337 100644
  }
 diff --git a/src/graphics/host_gpu/renderer/nativeDlssg.inc b/src/graphics/host_gpu/renderer/nativeDlssg.inc
 new file mode 100644
-index 00000000..5752adc1
+index 00000000..f96340ce
 --- /dev/null
 +++ b/src/graphics/host_gpu/renderer/nativeDlssg.inc
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,159 @@
 +#if KYTY_NGX && !defined(_WIN32)
 +using NativeMatrix = std::array<float, 16>;
 +
@@ -956,6 +1018,9 @@ index 00000000..5752adc1
 +	vk::Format           format = vk::Format::eUndefined;
 +	float                jitter[2] {};
 +	uint64_t             evaluations = 0;
++	uint32_t             max_frames = 1, generated_frames = 1, lower_windows = 0, window_frames = 0;
++	bool                 capability_checked = false;
++	std::chrono::steady_clock::time_point window_start {};
 +};
 +
 +NativeFgState& NativeFg() {
@@ -1181,8 +1246,29 @@ index 3f17232a..8d60048e 100644
  			step.dead = true;
  			std::printf("Game speed: no frame-rate block at 0x%llx, switch ignored\n", static_cast<unsigned long long>(addr));
  			return;
+diff --git a/src/graphics/presentation/window/lowLatency.cpp b/src/graphics/presentation/window/lowLatency.cpp
+index 5ff926ce..62261c35 100644
+--- a/src/graphics/presentation/window/lowLatency.cpp
++++ b/src/graphics/presentation/window/lowLatency.cpp
+@@ -1,6 +1,7 @@
+ #include "graphics/presentation/window/lowLatency.h"
+ 
+ #include "graphics/host_gpu/renderer/frameGen.h"
++#include "graphics/host_gpu/renderer/dlss.h"
+ #include "graphics/host_gpu/vulkanCommon.h"
+ 
+ #include <atomic>
+@@ -204,7 +205,7 @@ bool WantExtensions(bool has_low_latency2, bool has_present_id) {
+ 	if (!Requested()) {
+ 		return false;
+ 	}
+-	if (FrameGen::Requested()) {
++	if (FrameGen::Requested() && !Dlss::NativeFrameGenerationRequested()) {
+ 		std::printf("LowLatency: DLSS-G takes over the markers through Streamline's Reflex\n");
+ 		return false;
+ 	}
 diff --git a/src/graphics/presentation/window/swapchain.cpp b/src/graphics/presentation/window/swapchain.cpp
-index caa9055e..5a0356d2 100644
+index caa9055e..1e7cfa12 100644
 --- a/src/graphics/presentation/window/swapchain.cpp
 +++ b/src/graphics/presentation/window/swapchain.cpp
 @@ -1,3 +1,6 @@
@@ -1196,25 +1282,26 @@ index caa9055e..5a0356d2 100644
  namespace Libs::Graphics {
  
  struct Presenter::Frame {
-+    Frame* generated = nullptr;
-+    bool generated_valid = false;
++    std::array<Frame*, 3> generated {};
++    uint32_t generated_count = 0;
  	VulkanImage   image;
  	vk::ImageView view         = nullptr;
  	uint64_t      present_tick = 0;
-@@ -145,6 +150,12 @@ public:
+@@ -145,6 +150,13 @@ public:
  		if (!frame->busy) {
  			EXIT("prepared frame was released twice\n");
  		}
-+        if (frame->generated) {
-+            frame->generated->busy = false;
-+            m_free.push_back(frame->generated);
-+            frame->generated = nullptr;
-+            frame->generated_valid = false;
++        for (auto*& generated: frame->generated) {
++            if (!generated) continue;
++            generated->busy = false;
++            m_free.push_back(generated);
++            generated = nullptr;
 +        }
++        frame->generated_count = 0;
  		frame->busy = false;
  		m_free.push_back(frame);
  	}
-@@ -197,12 +208,22 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent,
+@@ -197,12 +209,22 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent,
  	create.initialLayout = vk::ImageLayout::eUndefined;
  	create.usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
  	               vk::ImageUsageFlagBits::eSampled;
@@ -1237,7 +1324,7 @@ index caa9055e..5a0356d2 100644
  }
  
  void Presenter::Frame::Transit(vk::CommandBuffer command, vk::ImageLayout layout,
-@@ -252,8 +273,17 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
+@@ -252,8 +274,17 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
  	copy.extent         = {std::min(source.backing.extent.width, image.extent.width),
  	                       std::min(source.backing.extent.height, image.extent.height), 1};
  	EXIT_IF(copy.srcSubresource.layerCount != copy.dstSubresource.layerCount);
@@ -1255,7 +1342,7 @@ index caa9055e..5a0356d2 100644
  }
  
  void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColorValue& color) {
-@@ -334,6 +364,8 @@ private:
+@@ -334,6 +365,8 @@ private:
  };
  
  struct Presenter::Impl {
@@ -1264,7 +1351,7 @@ index caa9055e..5a0356d2 100644
  	explicit Impl(WindowContext& owner)
  	    : renderer(*owner.render_context), window(owner), swapchain(owner),
  	      present_scheduler(renderer, owner.graphic_ctx, CommandScheduler::Role::Presenter),
-@@ -1268,6 +1300,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
+@@ -1268,6 +1301,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
  		case vk::Format::eB8G8R8A8Srgb: frame_format = vk::Format::eB8G8R8A8Unorm; break;
  		default: break;
  	}
@@ -1272,7 +1359,7 @@ index caa9055e..5a0356d2 100644
  	auto* frame = m_impl->frames.Acquire({info.extent.width, info.extent.height}, frame_format);
  	frame->hdr   = hdr;
  	frame->blank = false;
-@@ -1279,6 +1312,27 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
+@@ -1279,6 +1313,32 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
  	frame->Configure(m_impl->window.graphic_ctx,
  	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
  	frame->CopyFrom(buffer, image);
@@ -1287,20 +1374,25 @@ index caa9055e..5a0356d2 100644
 +    }
 +    if (!headset && Dlss::NativeFrameGenerationRequested() &&
 +        (frame->image.usage & vk::ImageUsageFlagBits::eStorage)) {
-+        auto* generated = m_impl->frames.Acquire({image.backing.extent.width, image.backing.extent.height}, frame_format);
-+        generated->Configure(m_impl->window.graphic_ctx,
-+            {image.backing.extent.width, image.backing.extent.height}, frame_format);
-+        generated->hdr = hdr;
-+        generated->blank = false;
-+        frame->generated = generated;
-+        frame->generated_valid = Dlss::GenerateFrame(m_impl->renderer, buffer,
-+            frame->image, static_cast<VkImageView>(frame->view), generated->image,
-+            static_cast<VkImageView>(generated->view), hdr);
++        const auto count = Dlss::NativeFramesToGenerate();
++        std::array<Dlss::GeneratedFrameTarget, 3> targets {};
++        for (uint32_t i = 0; i < count; ++i) {
++            auto* generated = m_impl->frames.Acquire({image.backing.extent.width, image.backing.extent.height}, frame_format);
++            generated->Configure(m_impl->window.graphic_ctx,
++                {image.backing.extent.width, image.backing.extent.height}, frame_format);
++            generated->hdr = hdr;
++            generated->blank = false;
++            frame->generated[i] = generated;
++            targets[i] = {&generated->image, static_cast<VkImageView>(generated->view)};
++        }
++        frame->generated_count = Dlss::GenerateFrames(m_impl->renderer, buffer,
++            frame->image, static_cast<VkImageView>(frame->view),
++            std::span<const Dlss::GeneratedFrameTarget>(targets.data(), count), hdr);
 +    }
  	if (headset) {
  		// The frame holds the raw display-encoded pixels the headset needs.
  		frame->Transit(buffer.Handle(), vk::ImageLayout::eTransferSrcOptimal,
-@@ -1358,6 +1412,31 @@ void Presenter::Present(std::span<const Layer> layers) {
+@@ -1358,6 +1418,34 @@ void Presenter::Present(std::span<const Layer> layers) {
  		}
  		previous = layer;
  	}
@@ -1312,31 +1404,35 @@ index caa9055e..5a0356d2 100644
 +    }
 +    m_impl->native_frame_time = native_now;
 +    auto* main_frame = m_impl->layers[0].frame;
-+    if (main_frame && main_frame->generated_valid) {
-+        m_impl->layers[0].frame = main_frame->generated;
-+        const auto before = m_impl->window.loop.presented_frames.load(std::memory_order_relaxed);
-+        m_impl->Present();
-+        if (m_impl->window.loop.presented_frames.load(std::memory_order_relaxed) > before) {
-+            static uint64_t generated_presented = 0;
-+            if (++generated_presented == 1 || generated_presented % 300 == 0) {
-+                std::printf("DLSS-G native: %llu generated frames presented\n",
-+                            static_cast<unsigned long long>(generated_presented));
-+                std::fflush(stdout);
++    if (main_frame && main_frame->generated_count != 0) {
++        const auto count = main_frame->generated_count;
++        for (uint32_t i = 0; i < count; ++i) {
++            m_impl->layers[0].frame = main_frame->generated[i];
++            const auto before = m_impl->window.loop.presented_frames.load(std::memory_order_relaxed);
++            m_impl->Present();
++            if (m_impl->window.loop.presented_frames.load(std::memory_order_relaxed) > before) {
++                static uint64_t generated_presented = 0;
++                if (++generated_presented == 1 || generated_presented % 300 == 0) {
++                    std::printf("DLSS-G native: %llu generated frames presented\n",
++                                static_cast<unsigned long long>(generated_presented));
++                    std::fflush(stdout);
++                }
 +            }
++            if (Config::GetPresentMode() != Config::PresentMode::Fifo)
++                std::this_thread::sleep_until(native_now + m_impl->native_frame_period * (i + 1) / (count + 1));
 +        }
 +        m_impl->layers[0].frame = main_frame;
-+        if (Config::GetPresentMode() != Config::PresentMode::Fifo)
-+            std::this_thread::sleep_until(native_now + m_impl->native_frame_period / 2);
-+        main_frame->generated_valid = false;
++        main_frame->generated_count = 0;
 +    }
  	m_impl->Present();
  }
  
-@@ -1414,6 +1493,7 @@ void Presenter::Impl::Present() {
+@@ -1414,6 +1502,8 @@ void Presenter::Impl::Present() {
  			for (const auto& layer: layers) {
  				if (layer.frame != nullptr) {
  					layer.frame->present_tick = tick;
-+                    if (layer.frame->generated) layer.frame->generated->present_tick = tick;
++                    for (auto* generated: layer.frame->generated)
++                        if (generated) generated->present_tick = tick;
  				}
  			}
  		}

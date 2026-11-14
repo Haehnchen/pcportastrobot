@@ -15,6 +15,59 @@ include Clang, Ninja, CMake, glslang-tools and Linux audio/window headers.
 Expected checkout directories: Tools/AnyPS5 and Tools/kyty-int21.
 Build: bash Tools/linux/build-hybrid.sh
 
+Local optimized release with DLSS SR and experimental Frame Generation:
+  bash Tools/linux/build-release.sh
+  bash Build/RunLinuxRelease/play.sh
+The release starter suppresses console output and does not create a console
+log. To enable diagnostic console output explicitly:
+  env ASTRO_VERBOSE=1 bash Build/RunLinuxRelease/play.sh
+Unexpected exits produce only a short error message and preserve the exit code.
+In a terminal, play.sh shows a numbered settings menu; Enter starts the game.
+Defaults: windowed 1280x720, DLSS performance, fixed 2x FG, 60 base FPS
+(120 FPS display target), low latency on, VSync/overlay off, game speed 100%.
+F11 or Alt+Enter toggles fullscreen. Choices cycle with keys 1-10 then Enter.
+Window sizes are 720p/900p/1080p/1440p/2160p; DLSS preset families are
+quality/balanced/performance/dlaa, plus the game's own upscaler.
+Disabling DLSS also disables FG. These options do not force internal render
+resolution or a fixed upscale ratio. Settings apply to this launch only.
+Use play.sh --no-menu to start immediately, or --settings to force the menu.
+The graphics choices follow the Windows launcher's runtime settings:
+- Base FPS: 30/35/45/50/55/60/unlimited, available with FG off.
+- FG: off/auto/fixed 2x/3x/4x. Target: unlocked/50/60/90/120/144/165.
+  As on Windows, the base cap is max(30, target / multiplier), or unlimited
+  with an unlocked target. Auto starts with a 2x base cap and adapts the
+  generated frame count to measured game FPS. Targets are not guarantees.
+- VSync (FIFO) is selectable with FG off. FG uses Immediate presentation.
+- Vulkan low latency (VK_NV_low_latency2), independently selectable.
+- Statistics: off/FPS/compact/full; speed: 100/95/90/85/80/75 percent.
+For scripted launches, ASTRO_LINUX_FG_MODE=off|auto|2x|3x|4x and
+ASTRO_LINUX_FG_TARGET=0|50|60|90|120|144|165 select the same FG plan.
+Native backend controls remain ASTROHYBRID_DLSSG_FRAMES (1-3 generated
+frames), ASTROHYBRID_DLSSG_TARGET and ASTROHYBRID_DLSSG_MAX_FRAMES.
+The original Windows launcher also only controls the host window size and
+DLSS model family, not the game's render resolution. There is no existing
+Windows Ultra Performance or fixed render-scale implementation to port.
+Windows alternate-lighting executables, controller/setup and OS process
+priority settings are outside this graphics launcher; no Linux equivalents
+are claimed here.
+Launcher syntax check:
+  bash -n Tools/linux/{build-release.sh,play-release.sh,release-menu.sh,run-dlss-experimental.sh}
+The native renderer builds with NGX; dlss.cpp also compiles with
+NGX disabled. On the local RTX 5060 Ti, NGX reports a 4x capability. Windowed
+4x plus low latency presented over 300 generated images with driver sleep
+calls reporting zero timeouts; Auto selected 4x and presented over 600.
+Those two Vulkan-validation runs reported no VUIDs. The intro-enabled run
+still reported the previously documented VUID-vkCmdDispatch-None-06479.
+These are startup/scene smoke tests, not a sustained FPS or latency benchmark.
+Uses CMake Release optimization and strips unneeded symbols from the staged
+GPU, host libraries and loader shims. Build-tree symbols remain available.
+Requires the prepared source checkouts, converted Build/RunLinux21564 game
+and Build/sdk/DLSS SDK. Override KYTY_NGX_SDK_DIR, ASTRO_LINUX_SOURCE_DIR or
+JOBS as needed. Pass a new output directory as the first argument for another
+build; existing output directories are never overwritten.
+This is a local release build, not a standalone distribution: game data and
+additional runtime libraries retain symlinks. DLSS/FG remain experimental.
+
 This is work in progress, not the previously demonstrated AnyPS5 renderer.
 The initial changes add an ELF shared-library target, System V lazy binding,
 NID symbol aliases, dlopen/dlsym host loading and Linux memory-map checks
@@ -63,7 +116,7 @@ The earlier assert is still considered intermittent/unresolved, not fixed.
 Tools/linux/run.sh now delegates to run-hybrid.sh; run-anyps5.sh retains
 an explicit standalone-renderer comparison path.
 
-Experimental native DLSS SR and 2x Frame Generation (Linux, RTX 5060 Ti):
+Experimental native DLSS SR and Frame Generation (Linux, RTX 5060 Ti):
 The Linux DLSS SDK is optional. Tested SDK: NVIDIA/DLSS revision
 9981c6350dc58c0ce21f024fd65e31e851c31689 (Linux runtime 310.9.16).
 SDK source: https://github.com/NVIDIA/DLSS
@@ -98,12 +151,17 @@ motion vectors are copied before later passes can overwrite them. Final
 lacks storage-image support. NGX writes a separate interpolation image;
 the presenter submits it before the corresponding real image. The experimental
 starter defaults KYTY_GPU_PRESENT_MODE=Immediate. The presenter spaces the
-real image half a measured game-frame interval after its generated image
-in non-FIFO modes. First/reset
+generated images and the real image evenly across a measured game-frame
+interval in non-FIFO modes. First/reset
 frames are withheld. Swapchain presentation mode controls display pacing;
-2x submissions do not guarantee twice the monitor's refresh rate. HUD
-separation, adaptive multipliers, Reflex and multi-frame generation are
-not implemented by this Linux backend. It remains experimental.
+More submissions do not guarantee a higher monitor scanout rate. The native
+backend queries NGX MultiFrameCountMax and supports up to three intermediate
+images (4x), with separate image lifetimes and ordered presentation. Unsupported
+multipliers are clamped to the runtime capability. Auto samples game frame
+rate in half-second windows and requires four lower-demand windows before
+reducing the multiplier. Vulkan low-latency markers/sleep now remain available
+with native FG; only the Windows Streamline path takes over those markers.
+HUD separation remains unimplemented. All native FG modes remain experimental.
 
 Local evidence:
 - dlss-init.log: actual in-game NGX initialization reports SR available and
