@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index cca6f074..c94b7774 100644
+index cca6f074..c0328bbd 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -2590,9 +2590,14 @@ target_link_libraries(kyty_emulator ${CMAKE_DL_LIBS})
@@ -20,13 +20,14 @@ index cca6f074..c94b7774 100644
  endif()
  # AstroHybrid: DLSS Frame Generation through Streamline (renderer/frameGen.cpp), headers only;
  # sl.interposer.dll is loaded at run time. Empty: not built in.
-@@ -2656,3 +2661,17 @@ endif()
+@@ -2656,3 +2661,26 @@ endif()
  if(KYTY_CLANG_CL)
  	install(FILES "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" DESTINATION .)
  endif()
 +
 +if(LINUX)
 +    option(KYTY_BUILD_HYBRID "Build the AstroHybrid GPU shared library" OFF)
++    option(KYTY_HYBRID_IPO "Enable release interprocedural optimization for the hybrid renderer" OFF)
 +    if(KYTY_BUILD_HYBRID)
 +        add_library(kyty_gpu SHARED ${kyty_emulator_src} "${KYTY_SOURCE_DIR}/hybrid/kytyGpuBridge.cpp")
 +        target_include_directories(kyty_gpu PRIVATE ${inc_headers})
@@ -36,6 +37,14 @@ index cca6f074..c94b7774 100644
 +        endif()
 +        target_link_options(kyty_gpu PRIVATE "-Wl,--exclude-libs,ALL" "-Wl,-z,defs")
 +        set_target_properties(kyty_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
++        if(KYTY_HYBRID_IPO)
++            include(CheckIPOSupported)
++            check_ipo_supported(RESULT hybrid_ipo_supported OUTPUT hybrid_ipo_error LANGUAGES CXX)
++            if(NOT hybrid_ipo_supported)
++                message(FATAL_ERROR "Hybrid IPO is unavailable: ${hybrid_ipo_error}")
++            endif()
++            set_property(TARGET kyty_gpu PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
++        endif()
 +    endif()
 +endif()
 diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
@@ -1270,7 +1279,7 @@ index 3f17232a..8d60048e 100644
  			std::printf("Game speed: no frame-rate block at 0x%llx, switch ignored\n", static_cast<unsigned long long>(addr));
  			return;
 diff --git a/src/graphics/presentation/window/lowLatency.cpp b/src/graphics/presentation/window/lowLatency.cpp
-index 5ff926ce..62261c35 100644
+index 5ff926ce..9d1634e7 100644
 --- a/src/graphics/presentation/window/lowLatency.cpp
 +++ b/src/graphics/presentation/window/lowLatency.cpp
 @@ -1,6 +1,7 @@
@@ -1290,8 +1299,39 @@ index 5ff926ce..62261c35 100644
  		std::printf("LowLatency: DLSS-G takes over the markers through Streamline's Reflex\n");
  		return false;
  	}
+@@ -253,6 +254,10 @@ bool Enabled() {
+ 	return Get().enabled.load(std::memory_order_acquire);
+ }
+ 
++std::unique_lock<std::mutex> LockSwapchain() {
++	return Enabled() ? std::unique_lock<std::mutex>(Get().mutex) : std::unique_lock<std::mutex>();
++}
++
+ const void* SwapchainCreateNext(const void* next) {
+ 	auto& s = Get();
+ 	if (!Enabled()) {
+diff --git a/src/graphics/presentation/window/lowLatency.h b/src/graphics/presentation/window/lowLatency.h
+index c30fd2b8..a8fdd5d0 100644
+--- a/src/graphics/presentation/window/lowLatency.h
++++ b/src/graphics/presentation/window/lowLatency.h
+@@ -2,6 +2,7 @@
+ #define EMULATOR_SRC_GRAPHICS_PRESENTATION_WINDOW_LOWLATENCY_H_
+ 
+ #include <cstdint>
++#include <mutex>
+ 
+ #include <vulkan/vulkan_core.h>
+ 
+@@ -39,6 +40,7 @@ void OnDeviceCreated(VkDevice device);
+ [[nodiscard]] const void* SwapchainCreateNext(const void* next);
+ void OnSwapchainCreated(VkSwapchainKHR swapchain);
+ void OnSwapchainDestroyed(VkSwapchainKHR swapchain);
++[[nodiscard]] std::unique_lock<std::mutex> LockSwapchain();
+ 
+ // Guest side.
+ void NoteFlipPacket();      // AgcDcbSetFlip (any thread)
 diff --git a/src/graphics/presentation/window/swapchain.cpp b/src/graphics/presentation/window/swapchain.cpp
-index caa9055e..1e7cfa12 100644
+index caa9055e..5c3e7663 100644
 --- a/src/graphics/presentation/window/swapchain.cpp
 +++ b/src/graphics/presentation/window/swapchain.cpp
 @@ -1,3 +1,6 @@
@@ -1374,7 +1414,24 @@ index caa9055e..1e7cfa12 100644
  	explicit Impl(WindowContext& owner)
  	    : renderer(*owner.render_context), window(owner), swapchain(owner),
  	      present_scheduler(renderer, owner.graphic_ctx, CommandScheduler::Role::Presenter),
-@@ -1268,6 +1301,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
+@@ -712,9 +745,13 @@ Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
+ 		m_frame_ticks[m_frame_index] = 0;
+ 	}
+ 	m_image_index     = static_cast<uint32_t>(-1);
+-	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
+-	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
+-	    &m_image_index);
++	vk::Result result;
++	{
++		auto latency_lock = LowLatency::LockSwapchain();
++		result = m_window.graphic_ctx.device.acquireNextImageKHR(
++		    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
++		    &m_image_index);
++	}
+ 	switch (result) {
+ 		case vk::Result::eSuccess: break;
+ 		case vk::Result::eSuboptimalKHR:
+@@ -1268,6 +1305,7 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
  		case vk::Format::eB8G8R8A8Srgb: frame_format = vk::Format::eB8G8R8A8Unorm; break;
  		default: break;
  	}
@@ -1382,7 +1439,7 @@ index caa9055e..1e7cfa12 100644
  	auto* frame = m_impl->frames.Acquire({info.extent.width, info.extent.height}, frame_format);
  	frame->hdr   = hdr;
  	frame->blank = false;
-@@ -1279,6 +1313,32 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
+@@ -1279,6 +1317,32 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
  	frame->Configure(m_impl->window.graphic_ctx,
  	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
  	frame->CopyFrom(buffer, image);
@@ -1415,7 +1472,7 @@ index caa9055e..1e7cfa12 100644
  	if (headset) {
  		// The frame holds the raw display-encoded pixels the headset needs.
  		frame->Transit(buffer.Handle(), vk::ImageLayout::eTransferSrcOptimal,
-@@ -1358,6 +1418,34 @@ void Presenter::Present(std::span<const Layer> layers) {
+@@ -1358,6 +1422,34 @@ void Presenter::Present(std::span<const Layer> layers) {
  		}
  		previous = layer;
  	}
@@ -1450,7 +1507,7 @@ index caa9055e..1e7cfa12 100644
  	m_impl->Present();
  }
  
-@@ -1414,6 +1502,8 @@ void Presenter::Impl::Present() {
+@@ -1414,6 +1506,8 @@ void Presenter::Impl::Present() {
  			for (const auto& layer: layers) {
  				if (layer.frame != nullptr) {
  					layer.frame->present_tick = tick;

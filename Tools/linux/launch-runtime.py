@@ -22,6 +22,7 @@ def prepare_environment(run_dir, environment):
             raise ValueError("invalid renderer preset")
         for key, value in values.items():
             environment.setdefault(key, value)
+        environment.setdefault("KYTY_TEXTURE_MEMO_SLOTS", "32768")
     if environment.get("ASTROHYBRID_DRAW_PREP_TUNING") != "0":
         environment.setdefault("KYTY_DRAW_PREP_SPIN_US", "10")
         environment.setdefault("KYTY_DRAW_PREP_COLD_SPIN_US", "5")
