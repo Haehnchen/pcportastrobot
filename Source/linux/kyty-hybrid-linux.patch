@@ -1,0 +1,331 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index cca6f074..bd543568 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2656,3 +2656,14 @@ endif()
+ if(KYTY_CLANG_CL)
+ 	install(FILES "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" DESTINATION .)
+ endif()
++
++if(LINUX)
++    option(KYTY_BUILD_HYBRID "Build the AstroHybrid GPU shared library" OFF)
++    if(KYTY_BUILD_HYBRID)
++        add_library(kyty_gpu SHARED ${kyty_emulator_src} "${KYTY_SOURCE_DIR}/hybrid/kytyGpuBridge.cpp")
++        target_include_directories(kyty_gpu PRIVATE ${inc_headers})
++        target_link_libraries(kyty_gpu PRIVATE ${kyty_emulator_link_libraries} ${CMAKE_DL_LIBS} pthread)
++        target_link_options(kyty_gpu PRIVATE "-Wl,--exclude-libs,ALL" "-Wl,-z,defs")
++        set_target_properties(kyty_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
++    endif()
++endif()
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+index 13dabc7b..d8f77ca0 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+@@ -38,7 +38,11 @@
+ 
+ #include <algorithm>
+ #include <bit>
++#if defined(_MSC_VER)
+ #include <intrin.h>
++#else
++#include <x86intrin.h>
++#endif
+ #include <array>
+ #include <atomic>
+ #include <chrono>
+diff --git a/src/graphics/host_gpu/renderer/dlss.cpp b/src/graphics/host_gpu/renderer/dlss.cpp
+index d43372e6..7c5a022f 100644
+--- a/src/graphics/host_gpu/renderer/dlss.cpp
++++ b/src/graphics/host_gpu/renderer/dlss.cpp
+@@ -20,7 +20,9 @@
+ #ifndef WIN32_LEAN_AND_MEAN
+ #define WIN32_LEAN_AND_MEAN
+ #endif
++#if defined(_WIN32)
+ #include <windows.h>
++#endif
+ 
+ #include <array>
+ #include <atomic>
+@@ -93,6 +95,7 @@ void RequiredExtensions(std::vector<const char*>& instance, std::vector<const ch
+ // ASTROHYBRID_DLSS_PROBE=1 (diagnostic): a throwaway device with only VK_NVX_binary_import,
+ // created through vulkan-1.dll directly; prints whether the driver accepts it at this point.
+ void ProbeBinaryImport(const char* when) {
++#if defined(_WIN32)
+ 	const char* value = std::getenv("ASTROHYBRID_DLSS_PROBE");
+ 	if (value == nullptr || std::strcmp(value, "1") != 0) {
+ 		return;
+@@ -172,6 +175,10 @@ void ProbeBinaryImport(const char* when) {
+ 		destroy_device(device, nullptr);
+ 	}
+ 	destroy_instance(instance, nullptr);
++#else
++    if (std::getenv("ASTROHYBRID_DLSS_PROBE") != nullptr)
++        std::printf("DLSS probe (%s): Windows diagnostic unavailable on this platform\n", when);
++#endif
+ }
+ 
+ } // namespace Dlss
+diff --git a/src/graphics/host_gpu/renderer/frameGen.cpp b/src/graphics/host_gpu/renderer/frameGen.cpp
+index 80f8eab1..a9d3962e 100644
+--- a/src/graphics/host_gpu/renderer/frameGen.cpp
++++ b/src/graphics/host_gpu/renderer/frameGen.cpp
+@@ -17,7 +17,9 @@
+ #ifndef WIN32_LEAN_AND_MEAN
+ #define WIN32_LEAN_AND_MEAN
+ #endif
++#if defined(_WIN32)
+ #include <windows.h>
++#endif
+ 
+ #if KYTY_STREAMLINE
+ #include <sl.h>
+diff --git a/src/graphics/presentation/videoOut.cpp b/src/graphics/presentation/videoOut.cpp
+index 3f17232a..8d60048e 100644
+--- a/src/graphics/presentation/videoOut.cpp
++++ b/src/graphics/presentation/videoOut.cpp
+@@ -941,6 +941,34 @@ struct GameStep {
+ // scales the result (90 = 10% slower). Every
+ // present writes the measured frame rate there (the limit itself when the cadence holds it), clamped
+ // to 20..120. ASTROHYBRID_GAME_STEP_ADDR overrides the address; the block is checked first.
++bool GameStepWritable(uint64_t address) {
++#if defined(_WIN32)
++    MEMORY_BASIC_INFORMATION info {};
++    return VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) == sizeof(info) &&
++           info.State == MEM_COMMIT && (info.Protect & (PAGE_READWRITE | PAGE_WRITECOPY)) != 0 &&
++           address + 24 <= reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
++#elif defined(__linux__)
++    FILE* maps = std::fopen("/proc/self/maps", "r");
++    if (maps == nullptr) return false;
++    char line[1024];
++    bool writable = false;
++    while (std::fgets(line, sizeof(line), maps) != nullptr) {
++        unsigned long long start = 0, end = 0;
++        char permissions[5] {};
++        if (std::sscanf(line, "%llx-%llx %4s", &start, &end, permissions) == 3 &&
++            address >= start && address < end && end - address >= 24 &&
++            permissions[0] == 'r' && permissions[1] == 'w') {
++            writable = true;
++            break;
++        }
++    }
++    std::fclose(maps);
++    return writable;
++#else
++    return false;
++#endif
++}
++
+ void UpdateGameStep(GameStep& step, uint64_t now, uint64_t frequency, uint32_t limit) {
+ 	static const bool enabled = [] {
+ 		const char* value = std::getenv("ASTROHYBRID_GAME_SPEED");
+@@ -952,9 +980,7 @@ void UpdateGameStep(GameStep& step, uint64_t now, uint64_t frequency, uint32_t l
+ 	if (!step.ready) {
+ 		const char* custom = std::getenv("ASTROHYBRID_GAME_STEP_ADDR");
+ 		const auto  addr   = custom != nullptr ? std::strtoull(custom, nullptr, 0) : 0x93F0040ull;
+-		MEMORY_BASIC_INFORMATION info {};
+-		if (VirtualQuery(reinterpret_cast<void*>(addr), &info, sizeof(info)) != sizeof(info) ||
+-		    info.State != MEM_COMMIT || (info.Protect & (PAGE_READWRITE | PAGE_WRITECOPY)) == 0) {
++		if (!GameStepWritable(addr)) {
+ 			step.dead = true;
+ 			std::printf("Game speed: no frame-rate block at 0x%llx, switch ignored\n", static_cast<unsigned long long>(addr));
+ 			return;
+diff --git a/src/hybrid/kytyGpuBridge.cpp b/src/hybrid/kytyGpuBridge.cpp
+index 8f4a8b97..05cfe465 100644
+--- a/src/hybrid/kytyGpuBridge.cpp
++++ b/src/hybrid/kytyGpuBridge.cpp
+@@ -53,6 +53,10 @@
+ 
+ #if defined(_WIN32)
+ #include <windows.h>
++#else
++#include <dlfcn.h>
++#include <signal.h>
++#include <ucontext.h>
+ #endif
+ 
+ namespace Libs {
+@@ -104,7 +108,7 @@ void Log(int level, const char* format, ...) {
+ extern "C" {
+ 
+ // One slot per export; the thunks read them with a RIP-relative indirect jump.
+-__attribute__((used)) void* g_kyty_gpu_slots[g_row_count];
++__attribute__((used, visibility("hidden"))) void* g_kyty_gpu_slots[g_row_count];
+ 
+ [[noreturn]] void KytyGpuUnboundNid(uint32_t index) {
+ 	const char* nid      = index < g_row_count ? g_rows[index].nid : "?";
+@@ -145,7 +149,11 @@ __attribute__((naked)) void KytyGpuUnboundTrap() {
+ 	                 "movdqu %xmm5, 112(%rsp)\n\t"
+ 	                 "movdqu %xmm6, 128(%rsp)\n\t"
+ 	                 "movdqu %xmm7, 144(%rsp)\n\t"
++	                 #if defined(_WIN32)
+ 	                 "movl %r11d, %ecx\n\t"
++#else
++	                 "movl %r11d, %edi\n\t"
++#endif
+ 	                 "callq KytyGpuLazyResolve\n\t"
+ 	                 "movq %rax, %r11\n\t"
+ 	                 "movdqu 32(%rsp), %xmm0\n\t"
+@@ -175,6 +183,13 @@ __attribute__((naked)) void KytyGpuUnboundTrap() {
+ #include "hybrid/kytyGpuNids.inc"
+ #undef KYTY_GPU_NID
+ 
++#if !defined(_WIN32)
++#define KYTY_GPU_NID(index, nid, library, function, binding) \
++    __asm__(".globl \"" nid "\"\n.set \"" nid "\", kyty_gpu_nid_" #index "\n");
++#include "hybrid/kytyGpuNids.inc"
++#undef KYTY_GPU_NID
++#endif
++
+ } // extern "C"
+ 
+ namespace {
+@@ -556,16 +571,63 @@ bool BridgeGuestAccessFault(const Common::HostException::ExceptionInfo& info) {
+ 	}();
+ 	bool guest_code = false;
+ 	if (guest_loads && access == GpuAccess::Read) {
++		#if defined(_WIN32)
+ 		static const HMODULE game = GetModuleHandleW(nullptr);
+ 		HMODULE              module = nullptr;
+ 		guest_code = GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+ 		                                reinterpret_cast<LPCWSTR>(info.exception_address), &module) != 0 &&
+ 		             module == game;
++#else
++		Dl_info module {};
++		guest_code = dladdr(reinterpret_cast<void*>(info.exception_address), &module) == 0;
++#endif
+ 	}
+ 	const GuestLoad::FaultScope guest_load(guest_code ? info.native_context : nullptr);
+ 	return Libs::LibKernel::Memory::HandleGpuFault(access, info.access_violation_vaddr);
+ }
+ 
++#if defined(__linux__)
++struct sigaction g_previous_segv {};
++struct sigaction g_previous_bus {};
++
++void BridgeSignal(int signal, siginfo_t* details, void* context) {
++    auto* uc = static_cast<ucontext_t*>(context);
++    Common::HostException::ExceptionInfo info {};
++    info.type = Common::HostException::ExceptionType::AccessViolation;
++    const auto error = uc->uc_mcontext.gregs[REG_ERR];
++    using Access = Common::HostException::AccessViolationType;
++    info.access_violation_type = (error & 16) ? Access::Execute : (error & 2) ? Access::Write : Access::Read;
++    info.access_violation_vaddr = reinterpret_cast<uint64_t>(details->si_addr);
++    info.exception_address = uc->uc_mcontext.gregs[REG_RIP];
++    info.native_context = context;
++    if (BridgeGuestAccessFault(info)) return;
++    const auto& previous = signal == SIGSEGV ? g_previous_segv : g_previous_bus;
++    if (previous.sa_handler == SIG_DFL || previous.sa_handler == SIG_IGN) {
++        sigaction(signal, &previous, nullptr);
++        return;
++    }
++    if (previous.sa_flags & SA_SIGINFO) previous.sa_sigaction(signal, details, context);
++    else previous.sa_handler(signal);
++}
++
++bool InstallBridgeFaultHandler() {
++    struct sigaction action {};
++    action.sa_sigaction = BridgeSignal;
++    action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
++    sigemptyset(&action.sa_mask);
++    if (sigaction(SIGSEGV, &action, &g_previous_segv) != 0) return false;
++    if (sigaction(SIGBUS, &action, &g_previous_bus) != 0) {
++        sigaction(SIGSEGV, &g_previous_segv, nullptr);
++        return false;
++    }
++    return true;
++}
++#else
++bool InstallBridgeFaultHandler() {
++    return Common::HostException::InstallFirstAccessHandler(BridgeGuestAccessFault);
++}
++#endif
++
+ uint32_t EnvironmentSize(const char* name, uint32_t fallback) {
+ 	const char* text = std::getenv(name);
+ 	const long  value = text != nullptr ? std::strtol(text, nullptr, 10) : 0;
+@@ -699,7 +761,7 @@ int ApiStartGraphics() {
+ 	if (g_host.publish_pad != nullptr) {
+ 		g_relay = std::thread(Relay);
+ 	}
+-	if (!Common::HostException::InstallFirstAccessHandler(BridgeGuestAccessFault)) {
++	if (!InstallBridgeFaultHandler()) {
+ 		Log(2, "start_graphics: Kyty's guest memory fault handler could not be installed");
+ 		return KYTY_GPU_E_STATE;
+ 	}
+@@ -791,12 +853,20 @@ std::mutex g_lazy;
+ 
+ const KytyGpuHostCallbacks* FindHost() {
+ 	const char* name   = std::getenv("KYTY_GPU_HOST_MODULE");
+-	HMODULE     module = LoadLibraryA(name != nullptr ? name : KYTY_GPU_HOST_MODULE_DEFAULT);
++	#if defined(_WIN32)
++	HMODULE module = LoadLibraryA(name != nullptr ? name : KYTY_GPU_HOST_MODULE_DEFAULT);
++#else
++	void* module = dlopen(name != nullptr ? name : KYTY_GPU_HOST_MODULE_DEFAULT, RTLD_NOW | RTLD_LOCAL);
++#endif
+ 	if (module == nullptr) {
+ 		return nullptr;
+ 	}
+ 	const auto entry = reinterpret_cast<KytyGpuHostEntryFn>(
++	    #if defined(_WIN32)
+ 	    reinterpret_cast<void*>(GetProcAddress(module, KYTY_GPU_HOST_ENTRY)));
++#else
++	    dlsym(module, KYTY_GPU_HOST_ENTRY));
++#endif
+ 	return entry != nullptr ? entry() : nullptr;
+ }
+ 
+diff --git a/src/kernel/memoryAddressSpace.inc b/src/kernel/memoryAddressSpace.inc
+index 24f538d2..de63ee80 100644
+--- a/src/kernel/memoryAddressSpace.inc
++++ b/src/kernel/memoryAddressSpace.inc
+@@ -1231,6 +1231,7 @@ public:
+ 		}
+ #else
+ 		for (const auto& [start, size]: m_owned) {
++            if (std::find(m_adopted.begin(), m_adopted.end(), std::make_pair(start, size)) != m_adopted.end()) continue;
+ 			munmap(reinterpret_cast<void*>(start), size);
+ 		}
+ #endif
+@@ -1873,6 +1874,41 @@ private:
+ #endif
+ 
+ 	void ReserveGuestRegions() {
++#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
++        if (!g_host_placeholders.empty()) {
++            for (const auto& [start, size] : g_host_placeholders) {
++                EXIT_IF(size == 0 || start + size < start);
++                FILE* maps = fopen("/proc/self/maps", "r");
++                EXIT_IF(maps == nullptr);
++                uint64_t cursor = start;
++                char line[512];
++                while (cursor < start + size && fgets(line, sizeof(line), maps) != nullptr) {
++                    unsigned long long begin = 0, end = 0;
++                    char permissions[5] {};
++                    if (sscanf(line, "%llx-%llx %4s", &begin, &end, permissions) != 3 || end <= cursor) continue;
++                    if (begin > cursor) {
++                        const auto gap_end = std::min<uint64_t>(begin, start + size);
++                        void* mapped = mmap(reinterpret_cast<void*>(cursor), gap_end - cursor, PROT_NONE,
++                                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
++                        EXIT_IF(mapped != reinterpret_cast<void*>(cursor));
++                        cursor = gap_end;
++                        if (cursor == start + size) break;
++                    }
++                    if (permissions[0] != '-' || permissions[1] != '-' || permissions[2] != '-') {
++                        std::fprintf(stderr, "Hybrid donation overlaps live mapping: %s", line);
++                        break;
++                    }
++                    cursor = std::min<uint64_t>(end, start + size);
++                }
++                fclose(maps);
++                EXIT_IF(cursor != start + size);
++                AddFreeUnlocked(start, size);
++                m_owned.emplace_back(start, size);
++                m_adopted.emplace_back(start, size);
++            }
++            return;
++        }
++#endif
+ #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+ 		constexpr uint64_t MinimumRegionSize = 0x1000000;
+ 		const auto         process           = GetCurrentProcess();
