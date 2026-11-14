@@ -1,3 +1,18 @@
+diff --git a/core/libs/prx/libc/src/GuestArena.cpp b/core/libs/prx/libc/src/GuestArena.cpp
+index bb9f930a84..0fc41b22bc 100644
+--- a/core/libs/prx/libc/src/GuestArena.cpp
++++ b/core/libs/prx/libc/src/GuestArena.cpp
+@@ -344,6 +344,10 @@ private:
+         }
+         _used.emplace(SystemReservedStart, SystemReservedEnd);
+         _hostRegions.emplace_back(SystemReservedStart, SystemReservedEnd);
++        if (std::getenv("ASTROHYBRID_CUDA_HOLE") != nullptr) {
++            _used.emplace(CudaWindowStart, CudaWindowEnd);
++            _hostRegions.emplace_back(CudaWindowStart, CudaWindowEnd);
++        }
+         ReserveFreeRanges();
+         _base = ArenaStart;
+         _end = ApplicationAreaEnd;
 diff --git a/core/libs/prx/libkernel/DirectMemory/Export.cpp b/core/libs/prx/libkernel/DirectMemory/Export.cpp
 index 8ac62570a5..2cd5d445c3 100644
 --- a/core/libs/prx/libkernel/DirectMemory/Export.cpp

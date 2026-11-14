@@ -8,6 +8,7 @@ root = Path(__file__).resolve().parents[2]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--source", type=Path, default=root / "Build/RunLinux21564")
 parser.add_argument("--output", type=Path, default=root / "Build/RunLinuxHybrid")
+parser.add_argument("--ngx-sdk", type=Path, help="optional NVIDIA DLSS SDK with Linux runtimes")
 args = parser.parse_args()
 source = args.source.resolve()
 output = args.output.resolve()
@@ -18,6 +19,12 @@ shims = ("libSceAgc.prx", "libSceAgcDriver.prx", "libSceVideoOut.prx")
 for required in (source / "AstroBot", source / "app0", gpu, *(host / name for name in fresh)):
     if not required.exists():
         parser.error(f"missing {required}; complete the hybrid build first")
+ngx_files = []
+if args.ngx_sdk:
+    runtime = args.ngx_sdk.resolve() / "lib/Linux_x86_64/rel"
+    ngx_files = sorted(runtime.glob("libnvidia-ngx-dlss*.so.*"))
+    if not any(item.name.startswith("libnvidia-ngx-dlss.so.") for item in ngx_files):
+        parser.error(f"missing Linux DLSS runtime in {runtime}")
 if output.exists():
     parser.error(f"output already exists: {output}; choose a new directory")
 (output / "libs").mkdir(parents=True)
@@ -29,6 +36,10 @@ for item in (source / "libs").glob("*.prx"):
 for name in fresh:
     shutil.copy2(host / name, output / "libs" / name)
 shutil.copy2(gpu, output / "libs" / gpu.name)
+if ngx_files:
+    (output / "ngx-runtime").mkdir()
+    for item in ngx_files:
+        shutil.copy2(item, output / "ngx-runtime" / item.name)
 work = output / "shim-build"
 work.mkdir()
 for name in shims:
