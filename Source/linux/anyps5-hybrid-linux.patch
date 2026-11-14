@@ -1,8 +1,43 @@
+diff --git a/core/libs/prx/libc/include/GuestArena.hpp b/core/libs/prx/libc/include/GuestArena.hpp
+index ee019cfa53..e568b1f5b2 100644
+--- a/core/libs/prx/libc/include/GuestArena.hpp
++++ b/core/libs/prx/libc/include/GuestArena.hpp
+@@ -78,6 +78,11 @@ void GuestArenaSetSharedBackingWriter_nid_no_patch(SharedBackingWriter writer);
+ bool GuestArenaWriteSharedBacking_nid_no_patch(std::uintptr_t address, const void* source, std::size_t bytes);
+ bool GuestArenaSharedBacking_nid_postfix(std::uintptr_t address, std::size_t bytes, int* file, std::uint64_t* offset);
+ #endif
++#if defined(__linux__)
++using HostWriteBeginHook = void* (*)(std::uintptr_t, std::size_t);
++using HostWriteEndHook = void (*)(void*);
++void GuestArenaSetHostWriteHooks_nid_no_patch(HostWriteBeginHook begin, HostWriteEndHook end);
++#endif
+ bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes);
+ void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes);
+ void GuestArenaSetHostReadHook_nid_no_patch(void (*hook)(std::uintptr_t address, std::size_t bytes));
 diff --git a/core/libs/prx/libc/src/GuestArena.cpp b/core/libs/prx/libc/src/GuestArena.cpp
-index bb9f930a84..0fc41b22bc 100644
+index bb9f930a84..d2c996b236 100644
 --- a/core/libs/prx/libc/src/GuestArena.cpp
 +++ b/core/libs/prx/libc/src/GuestArena.cpp
-@@ -344,6 +344,10 @@ private:
+@@ -34,6 +34,18 @@ namespace GuestArena {
+ namespace {
+ 
+ std::atomic<void (*)(std::uintptr_t, std::size_t)> hostReadHook{nullptr};
++#if defined(__linux__)
++std::mutex hostWriteHooksMutex;
++HostWriteBeginHook hostWriteBeginHook = nullptr;
++HostWriteEndHook hostWriteEndHook = nullptr;
++struct HostWriteScope {
++    void* pointer = nullptr;
++    std::size_t bytes = 0;
++    HostWriteEndHook end = nullptr;
++    void* token = nullptr;
++};
++thread_local std::vector<HostWriteScope> hostWriteScopes;
++#endif
+ 
+ #ifdef _WIN32
+ std::atomic<std::uint64_t> commitGeneration{1};
+@@ -344,6 +356,10 @@ private:
          }
          _used.emplace(SystemReservedStart, SystemReservedEnd);
          _hostRegions.emplace_back(SystemReservedStart, SystemReservedEnd);
@@ -13,6 +48,79 @@ index bb9f930a84..0fc41b22bc 100644
          ReserveFreeRanges();
          _base = ArenaStart;
          _end = ApplicationAreaEnd;
+@@ -809,10 +825,39 @@ void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t byt
+     if (const auto hook = hostReadHook.load(std::memory_order_acquire)) hook(address, bytes);
+ }
+ 
++#if defined(__linux__)
++void GuestArenaSetHostWriteHooks_nid_no_patch(HostWriteBeginHook begin, HostWriteEndHook end) {
++    if ((begin == nullptr) != (end == nullptr)) throw std::invalid_argument("Host write hooks must be installed as a pair");
++    std::lock_guard lock(hostWriteHooksMutex);
++    hostWriteBeginHook = begin;
++    hostWriteEndHook = end;
++}
++#endif
++
+ bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
+ #ifdef _WIN32
+     return WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+ #else
++#if defined(__linux__)
++    HostWriteBeginHook begin = nullptr;
++    HostWriteEndHook end = nullptr;
++    {
++        std::lock_guard lock(hostWriteHooksMutex);
++        begin = hostWriteBeginHook;
++        end = hostWriteEndHook;
++    }
++    const auto index = hostWriteScopes.size();
++    hostWriteScopes.push_back({pointer, bytes, nullptr, nullptr});
++    if (begin) {
++        try {
++            void* token = begin(reinterpret_cast<std::uintptr_t>(pointer), bytes);
++            hostWriteScopes[index] = {pointer, bytes, end, token};
++        } catch (...) {
++            hostWriteScopes.pop_back();
++            throw;
++        }
++    }
++#endif
+     GuestWriteWatch::GuestWriteWatchBeginHostWrite_nid_postfix(pointer, bytes);
+     return true;
+ #endif
+@@ -833,6 +878,14 @@ void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
+     WindowsMappings::Get().EndHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+ #else
+     GuestWriteWatch::GuestWriteWatchEndHostWrite_nid_postfix(pointer, bytes);
++#if defined(__linux__)
++    const auto found = std::find_if(hostWriteScopes.rbegin(), hostWriteScopes.rend(),
++        [&](const auto& scope) { return scope.pointer == pointer && scope.bytes == bytes; });
++    if (found == hostWriteScopes.rend()) std::terminate();
++    const auto scope = *found;
++    hostWriteScopes.erase(std::next(found).base());
++    if (scope.end) scope.end(scope.token);
++#endif
+ #endif
+ }
+ 
+diff --git a/core/libs/prx/libkernel/CMakeLists.txt b/core/libs/prx/libkernel/CMakeLists.txt
+index 7984ccd308..2d021e35cb 100644
+--- a/core/libs/prx/libkernel/CMakeLists.txt
++++ b/core/libs/prx/libkernel/CMakeLists.txt
+@@ -2046,6 +2046,13 @@ if(BUILD_TESTING)
+         set_tests_properties(guest_file_vector PROPERTIES ENVIRONMENT_MODIFICATION
+             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+     endif()
++    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
++        add_test_executable(guest_host_write_hooks_tests ${LIBS_INCLUDE_DIR}/tests/GuestHostWriteHooks.cpp)
++        target_include_directories(guest_host_write_hooks_tests PRIVATE ${LIBS_INCLUDE_DIR})
++        target_link_libraries(guest_host_write_hooks_tests PRIVATE libkernel libc)
++        add_test(NAME guest_host_write_hooks COMMAND guest_host_write_hooks_tests)
++        set_tests_properties(guest_host_write_hooks PROPERTIES TIMEOUT 20)
++    endif()
+     add_test_executable(guest_file_vector_memory_tests ${LIBS_INCLUDE_DIR}/tests/GuestFileVectorMemory.cpp)
+     target_include_directories(guest_file_vector_memory_tests PRIVATE ${LIBS_INCLUDE_DIR})
+     target_link_libraries(guest_file_vector_memory_tests PRIVATE libkernel libc)
 diff --git a/core/libs/prx/libkernel/DirectMemory/Export.cpp b/core/libs/prx/libkernel/DirectMemory/Export.cpp
 index 8ac62570a5..2cd5d445c3 100644
 --- a/core/libs/prx/libkernel/DirectMemory/Export.cpp
@@ -37,3 +145,119 @@ index 8ac62570a5..2cd5d445c3 100644
  #endif
  }
  
+diff --git a/core/libs/tests/GuestHostWriteHooks.cpp b/core/libs/tests/GuestHostWriteHooks.cpp
+new file mode 100644
+index 0000000000..83d90b9164
+--- /dev/null
++++ b/core/libs/tests/GuestHostWriteHooks.cpp
+@@ -0,0 +1,87 @@
++#include "prx/libkernel/include/Api.hpp"
++#include "prx/libkernel/File/include/File.hpp"
++#include "prx/libc/include/General.hpp"
++#include "prx/libc/include/GuestArena.hpp"
++#include "prx/libkernel/File/include/FileFlags.hpp"
++#include <array>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <sys/mman.h>
++#include <unistd.h>
++
++namespace {
++void Check(bool value) {
++    if (!value) std::abort();
++}
++char* memory;
++std::size_t page;
++std::array<unsigned, 2> pins{};
++unsigned begins = 0, ends = 0;
++struct Token { std::array<bool, 2> pages{}; };
++
++void* Begin(std::uintptr_t address, std::size_t bytes) {
++    ++begins;
++    auto* token = new Token;
++    for (unsigned i = 0; i < 2; ++i) {
++        const auto start = reinterpret_cast<std::uintptr_t>(memory + i * page);
++        if (bytes != 0 && address < start + page && address + bytes > start) {
++            token->pages[i] = true;
++            if (pins[i]++ == 0) Check(mprotect(memory + i * page, page, PROT_READ | PROT_WRITE) == 0);
++        }
++    }
++    return token;
++}
++void End(void* value) {
++    ++ends;
++    auto* token = static_cast<Token*>(value);
++    for (unsigned i = 0; i < 2; ++i)
++        if (token->pages[i] && --pins[i] == 0) Check(mprotect(memory + i * page, page, PROT_READ) == 0);
++    delete token;
++}
++}
++
++int main() {
++    page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
++    memory = static_cast<char*>(mmap(nullptr, page * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
++    Check(memory != MAP_FAILED);
++    std::memset(memory, '?', page * 2);
++    Check(mprotect(memory, page * 2, PROT_READ) == 0);
++    const auto path = std::filesystem::temp_directory_path() / ("anyps5-host-write-" + std::to_string(getpid()));
++    { std::ofstream file(path, std::ios::binary); file << "ABCDEFGH"; Check(bool(file)); }
++    AddPathAlias_nid_no_patch("/host-write-tests", path.parent_path().string().c_str());
++    const auto guest = "/host-write-tests/" + path.filename().string();
++    const int fd = sceKernelOpen(guest.c_str(), SCE_KERNEL_O_RDONLY, 0);
++    Check(fd >= 0);
++    constexpr auto fault = static_cast<std::int32_t>(0x8002000e);
++    Check(sceKernelPread(fd, memory, 4, 0) == fault);
++    Check(memory[0] == '?');
++    GuestArena::GuestArenaSetHostWriteHooks_nid_no_patch(Begin, End);
++    Check(sceKernelRead(fd, memory, 4) == 4);
++    Check(std::memcmp(memory, "ABCD", 4) == 0);
++    Check(sceKernelPread(fd, memory + page - 2, 4, 4) == 4);
++    Check(std::memcmp(memory + page - 2, "EFGH", 4) == 0);
++    std::array<KernelIovec, 2> iov{{{memory + 16, 2}, {memory + page + 16, 2}}};
++    Check(sceKernelPreadv(fd, iov.data(), iov.size(), 0) == 4);
++    Check(std::memcmp(memory + 16, "AB", 2) == 0);
++    Check(std::memcmp(memory + page + 16, "CD", 2) == 0);
++    Check(sceKernelReadv(fd, iov.data(), iov.size()) == 4);
++    Check(std::memcmp(memory + 16, "EF", 2) == 0);
++    Check(std::memcmp(memory + page + 16, "GH", 2) == 0);
++    Check(begins == ends && pins[0] == 0 && pins[1] == 0);
++    Check(GuestArena::GuestArenaBeginHostWrite_nid_postfix(memory, 1));
++    Check(GuestArena::GuestArenaBeginHostWrite_nid_postfix(memory + page, 1));
++    GuestArena::GuestArenaEndHostWrite_nid_postfix(memory, 1);
++    Check(pins[0] == 0 && pins[1] == 1);
++    GuestArena::GuestArenaSetHostWriteHooks_nid_no_patch(nullptr, nullptr);
++    GuestArena::GuestArenaEndHostWrite_nid_postfix(memory + page, 1);
++    Check(begins == ends && pins[1] == 0);
++    Check(sceKernelPread(fd, memory, 4, 0) == fault);
++    Check(sceKernelClose(fd) == 0);
++    Check(munmap(memory, page * 2) == 0);
++    std::filesystem::remove(path);
++    std::puts("Protected scalar/vector reads and host-write hook lifetimes passed");
++}
+diff --git a/docs/dev/BUILD.md b/docs/dev/BUILD.md
+index b6034dec89..dd938db734 100644
+--- a/docs/dev/BUILD.md
++++ b/docs/dev/BUILD.md
+@@ -373,3 +373,18 @@ ctest --test-dir build/register-context --output-on-failure
+ ```
+ 
+ On Linux x86-64, omit `CMAKE_OSX_ARCHITECTURES`; the full `BUILD_TESTING` build also registers these tests. Apple silicon runs the x86-64 tests through Rosetta. They cover the unwinder's register transfer, not the complete macOS runtime or guest exception handling.
++
++### Linux host-write regression
++
++With `BUILD_TESTING=ON`, build `guest_host_write_hooks_tests`,
++`guest_file_vector_tests`, `guest_file_vector_memory_tests`, `guest_aio_tests`,
++and `guest_aio_registry_tests`. Run:
++
++```sh
++ctest --test-dir build -R '^(guest_host_write_hooks|guest_file_vector|guest_file_vector_memory|guest_aio.*)$' --output-on-failure
++```
++
++The host-write test first verifies that a kernel read into a read-only page
++returns EFAULT, then registers host-write callbacks and verifies scalar,
++positioned, and vectored reads, overlapping-page access, out-of-order scope
++completion, and callback removal while a scope remains active.

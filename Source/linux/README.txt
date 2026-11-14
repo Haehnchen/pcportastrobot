@@ -128,3 +128,38 @@ Final paced Immediate smoke test: dlss-paced-smoke.log reports over 2100
 successful FG evaluations and generated-frame presentations, with SR
 1920x1080 -> 2432x1368 and no fallbacks in sampled intervals. The galaxy
 map is visible in dlss-paced.png. This is not a controlled FPS benchmark.
+
+Linux asset-loading host-write fix
+---------------------------------
+Tracing the intro's file reads reproduced EFAULT on GPU-tracked guest buffers.
+Linux kernel reads cannot invoke the user-space fault handler that normally
+opens Kyty's write-watched pages. The game then consumes missing/stale asset
+data; one captured failure reported a missing ODX definition after the read
+of that definition had failed. Earlier runs also hit duplicate/empty names.
+
+The libc HostWrite scope now supports paired Linux renderer callbacks. Kyty
+uses them to resolve tracked write/access faults before the host writes and
+holds its renderer lock until the write scope ends, preventing re-protection
+in the middle of a syscall. Only tracked pages are opened; ordinary read-only
+memory retains the normal EFAULT behavior. Scopes retain their matching end
+callback and token, including nested/out-of-order scope completion. This
+covers scalar, positioned, vectored and AIO reads through their existing
+HostWrite guards. No game executable, asset or assertion bypass is changed.
+
+Rebuild both host libc and kyty_gpu: the bridge now requires the corresponding
+host-write registration export, and reports a rebuild error for an older libc.
+The current local RunLinuxHybrid libraries have been updated together.
+
+Validation: 10 focused tests passed (host-write hooks, vector reads/memory,
+and seven AIO cases). Three intro-enabled runs with DLSS/FG completed their
+130/180/180-second observation windows without a traced EFAULT or game assert.
+The final run uses the narrower tracked-page check and Vulkan validation.
+Local logs: Build/debug-objectdefs/hostwrite-fixed1.log, hostwrite-fixed2.log,
+and hostwrite-final-validation.log. This addresses the observed file-loading
+failure, not a guarantee against unrelated game or renderer failures.
+The intro validation comparison reports the same 10 instances of
+VUID-vkCmdDispatch-None-06479 both with the fix and with its callbacks disabled
+for a diagnostic baseline (hostwrite-baseline-validation.log). This separate
+color-texture/depth-comparison shader issue remains unresolved; the host-write
+fix added no new VUID category in this comparison. Diagnostic interposers are
+local Build artifacts and are not part of the launcher or shipped patches.
