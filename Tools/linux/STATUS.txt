@@ -1,0 +1,77 @@
+Linux bootstrap experiment, 2026-11-14
+
+Base: AnyPS5 319621ba2e578bd053b0baba2877fe70520e0737, without
+AstroHybrid patches. Checkout and recursive submodules: Tools/AnyPS5.
+
+Built: Build/linux-relinker/core/relinker/relinker (GCC 15.2, Release).
+Passed: andn_lowering, masked_store_lowering, relinker_conversion,
+native_path, input_magic (5/5).
+
+Input: locally available PPSA21567 01.018.000 dump. Unwrapped eboot.bin,
+libc.prx and libSceNpCppWebApi.prx into Build/linux-input using
+Tools/AnyPS5/tools/unwrap_self.py. Original dump unchanged.
+
+Conversion succeeded:
+Build/linux-relinker/core/relinker/relinker Build/linux-input/eboot.elf Build/RunLinux/AstroBot
+Output is a native x86-64 Linux ELF with /lib64/ld-linux-x86-64.so.2.
+Bundled modules were converted into Build/RunLinux/app0/sce_module.
+Conversion log: Build/RunLinux/relink.log.
+
+First launch: dynamic loader exits 127, missing libSceNpManager.prx.
+No game code executed, no rendered frame or gameplay established.
+
+Full runtime CMake configuration succeeded. Build started with:
+bash Tools/linux/build-runtime.sh
+Build log for this session: /tmp/astro-linux-runtime.log
+Runtime compilation completed successfully (all 2416 remaining steps).
+The first build failed because ccache could not write inside the sandbox;
+the authorized build outside the sandbox succeeded.
+Continuation log: /tmp/astro-linux-runtime-continue.log.
+
+RunLinux/libs links to the built Linux libraries. Missing top-level app0
+assets link to the original dump; converted sce_module files are preserved.
+Run with: bash Tools/linux/run.sh
+
+Hardware startup successfully enters game main(), starts worker threads,
+initializes save memory, creates Vulkan device/swapchain on RTX 5060 Ti,
+and compiles shaders (1012 shader cache writes in the recorded interval).
+It then asserts in engine/app/Common/Result.cpp:93 with 0x84020001.
+No rendered frame or gameplay has been verified.
+Logs: Build/RunLinux/startup-native.log, debug-native.log, debug-assert.log.
+
+GDB confirms deliberate int 0x41 at 0x402844, rather than an ordinary
+null dereference. Saved frame return addresses: 0x699a69, 0x11d4651.
+At 0x699906 the game calls virtual method [vtable+0x78]; a false return
+branches to 0x699a59, which constructs 0x84020001 itself and reports it.
+The code is therefore a game-generated error, not an identified PS5 API
+error. Next diagnostic: identify this virtual method and object state.
+
+Next: diagnose the failed game-side virtual check. Original assets must
+remain unchanged. Hybrid GPU bridge is not ported; this experiment uses
+the upstream AnyPS5 runtime. No WPF launcher is required for this stage.
+
+Follow-up: resolved startup blocker using a complete, separate dump
+----------------------------------------------------------------
+GDB at 0x699909 found object path:
+/app0/data/prein/sound/Next Gen/pri_buss/pri_master_buss.szd
+Virtual method 0x699e20 tests file handle at object+0x118 against -1.
+This file is absent as a loose file in the PPSA21567 packed/backport dump.
+It exists in the separate, complete PPSA21564 dump.
+
+Converted PPSA21564's own executable and both bundled modules into
+Build/RunLinux21564, using only that dump's assets. No cross-version
+mixing or game-code patch. Original sources unchanged.
+The new run passes the previous assert and logs Resident Load end,
+Armadillo Load end, worldmap and bot_placement resource loading.
+
+CONFIRMED VISIBLE OUTPUT: Build/RunLinux21564/frame_004.png shows
+"Sony Interactive Entertainment presents". Captured through the runtime's
+GPU frame readback with APS5_DUMP_FRAMES=5 APS5_DUMP_FRAMES_EVERY=60.
+Evidence: Build/RunLinux21564/frames.log and frame_000..004.bmp.
+Menu/gameplay/audio/controller operation are not verified yet.
+
+Tools/linux/run.sh now defaults to Build/RunLinux21564. Override with
+ASTRO_LINUX_RUN_DIR to select another prepared directory. This still uses
+upstream AnyPS5 graphics, not the Windows AstroHybrid/Kyty bridge.
+Next: extend startup observation through title/menu, verify controls,
+and investigate any rendering/runtime issues encountered there.

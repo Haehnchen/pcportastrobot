@@ -4,6 +4,7 @@ Usage: python -I Tools/disasm.py <va> [bytes_before=0x40] [bytes_after=0x80] [el
 The first lines can be mis-decoded when <va> - bytes_before is not an instruction boundary.
 """
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -31,6 +32,11 @@ else:
 with tempfile.NamedTemporaryFile(suffix='.bin', delete=False) as handle:
     handle.write(blob)
 objdump = os.path.join(root, 'Tools', 'winlibs', 'mingw64', 'bin', 'objdump.exe')
+if os.name != 'nt' or not os.path.isfile(objdump):
+    objdump = shutil.which('objdump')
+if not objdump:
+    os.unlink(handle.name)
+    sys.exit('objdump not found; install binutils')
 result = subprocess.run([objdump, '-D', '-b', 'binary', '-m', 'i386:x86-64', '-M', 'intel', '--no-show-raw-insn',
                          f'--adjust-vma={start:#x}', handle.name], capture_output=True, text=True)
 os.unlink(handle.name)
