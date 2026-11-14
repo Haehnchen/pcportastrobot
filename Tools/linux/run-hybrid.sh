@@ -27,4 +27,4 @@ fi
 if [[ -n "${ASTROHYBRID_GAME_STEP_ADDR:-}" ]]; then
     export ASTROHYBRID_GAME_SPEED="${ASTROHYBRID_GAME_SPEED:-1}"
 fi
-exec ./AstroBot "$@"
+exec python3 "$root/Tools/linux/launch-runtime.py" "$@"

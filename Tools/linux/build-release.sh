@@ -19,7 +19,7 @@ for library in libkyty_gpu.so libc.prx libkernel.prx libScePad.prx libAstroHybri
     strip --strip-unneeded "$output/libs/$library"
 done
 mkdir -p "$output/Tools/linux"
-cp "$root/Tools/linux/"{run-hybrid.sh,run-dlss-experimental.sh,find-game-step.py,release-menu.sh} "$output/Tools/linux/"
+cp "$root/Tools/linux/"{run-hybrid.sh,run-dlss-experimental.sh,find-game-step.py,release-menu.sh,launch-runtime.py} "$output/Tools/linux/"
 cp "$root/Tools/linux/play-release.sh" "$output/play.sh"
 chmod +x "$output/play.sh"
 printf 'Release build ready: %s/play.sh\nDLSS SR and experimental 2x Frame Generation enabled by default.\nGame data and additional runtime libraries still use local symlinks.\n' "$output"

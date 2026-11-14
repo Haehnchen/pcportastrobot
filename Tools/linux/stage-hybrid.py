@@ -14,9 +14,10 @@ source = args.source.resolve()
 output = args.output.resolve()
 host = root / "Build/linux-hybrid-host/core/libs/libs"
 gpu = root / "Build/linux-kyty/libkyty_gpu.so"
+preset = root / "Tools/kyty-int21/tools/u59-preset.json"
 fresh = ("libc.prx", "libkernel.prx", "libScePad.prx", "libAstroHybridHost.prx")
 shims = ("libSceAgc.prx", "libSceAgcDriver.prx", "libSceVideoOut.prx")
-for required in (source / "AstroBot", source / "app0", gpu, *(host / name for name in fresh)):
+for required in (source / "AstroBot", source / "app0", gpu, preset, *(host / name for name in fresh)):
     if not required.exists():
         parser.error(f"missing {required}; complete the hybrid build first")
 ngx_files = []
@@ -36,6 +37,7 @@ for item in (source / "libs").glob("*.prx"):
 for name in fresh:
     shutil.copy2(host / name, output / "libs" / name)
 shutil.copy2(gpu, output / "libs" / gpu.name)
+shutil.copy2(preset, output / "u59-preset.json")
 if ngx_files:
     (output / "ngx-runtime").mkdir()
     for item in ngx_files:

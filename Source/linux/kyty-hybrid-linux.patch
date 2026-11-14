@@ -1196,6 +1196,29 @@ index 25b4d339..2e19a622 100644
  			NoteFrameGenCamera(*bindings.pixel);
  			TagFrameGen(buffer, *bindings.pixel);
  		}
+diff --git a/src/graphics/presentation/performanceOverlay.cpp b/src/graphics/presentation/performanceOverlay.cpp
+index 1b784f95..c2146334 100644
+--- a/src/graphics/presentation/performanceOverlay.cpp
++++ b/src/graphics/presentation/performanceOverlay.cpp
+@@ -715,6 +715,18 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
+ 			shown.low_fps = *percentile > 0.0f ? 1000.0 / *percentile : 0.0;
+ 		}
+ 		Refresh(shown, graphics, now, generation);
++		static const bool frame_stats = [] {
++			const char* value = std::getenv("ASTROHYBRID_FRAME_STATS");
++			return value != nullptr && std::strcmp(value, "1") == 0;
++		}();
++		if (frame_stats) {
++			std::printf("FrameStats: fps=%.2f mean_ms=%.2f worst_ms=%.2f low_1pct=%.2f "
++			            "shaders_s=%.1f pipelines_s=%.1f gpu_wait_ms_s=%.2f\n",
++			            shown.fps, shown.frame_ms, shown.max_frame_ms, shown.low_fps,
++			            shown.rates[static_cast<size_t>(Counter::ShadersCompiled)],
++			            shown.rates[static_cast<size_t>(Counter::PipelinesCreated)],
++			            shown.rates[static_cast<size_t>(Counter::GpuWaitNs)] / 1e6);
++		}
+ 	}
+ 
+ 	const float scale = std::clamp(std::min(static_cast<float>(extent.width) / 1920.0f,
 diff --git a/src/graphics/presentation/videoOut.cpp b/src/graphics/presentation/videoOut.cpp
 index 3f17232a..8d60048e 100644
 --- a/src/graphics/presentation/videoOut.cpp
